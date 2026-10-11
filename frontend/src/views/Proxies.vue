@@ -53,53 +53,16 @@
         >
           一键创建 WARP
         </el-button>
-        <el-button
-          v-if="hasLegacyWarp"
-          type="warning"
-          :icon="RefreshRight"
-          :loading="refreshingAllWarps"
-          :disabled="warpUnavailable || !hasEnabledWarp || refreshingAllWarps || refreshingIds.size > 0"
-          @click="refreshAllWarps"
-        >
-          立即刷新旧版 WARP
-        </el-button>
         <el-button :icon="Refresh" :loading="loading" @click="refreshAll">刷新页面状态</el-button>
         <span class="toolbar-spacer" />
-        <div v-if="hasLegacyWarp" class="warp-runtime">
-          <span>旧版容器 WARP</span>
-          <el-tag :type="warpStatusType" size="small">{{ warpStatusText }}</el-tag>
-        </div>
+        <el-tag :type="lightweightWarpAvailable ? 'success' : 'info'" size="small">WARP {{ lightweightWarpAvailable ? '可用' : '不可用' }}</el-tag>
       </div>
       <div v-if="globalProxyError" class="runtime-error">全局代理：{{ globalProxyError }}</div>
-      <div v-if="hasLegacyWarp && (warpStatusError || warpStatus?.error)" class="runtime-error">{{ warpStatusError || warpStatus?.error }}</div>
-      <div v-if="hasLegacyWarp && maintenance && warpStatus?.enabled" class="warp-maintenance" aria-label="WARP 自动维护状态">
-        <div class="maintenance-state">
-          <el-tag :type="maintenanceStatusType" size="small">
-            {{ maintenanceStatusText }}
-          </el-tag>
-          <span>每 {{ maintenance.healthCheckIntervalMinutes }} 分钟巡检</span>
-          <span>连续 {{ maintenance.failureThreshold }} 次失败后自动恢复</span>
-          <span>恢复冷却 {{ maintenance.recoveryCooldownMinutes }} 分钟</span>
-        </div>
-        <div class="maintenance-schedule">
-          <span v-if="maintenance.scheduledRefreshEnabled">
-            定时刷新：每 {{ formatDuration(maintenance.scheduledRefreshIntervalMinutes) }}
-          </span>
-          <span v-else>健康时保持当前出口，不主动更换 IP</span>
-          <span v-if="maintenance.lastRunAtUtc">最近巡检：{{ formatTime(maintenance.lastRunAtUtc, '-') }}</span>
-          <span v-if="maintenance.nextRunAtUtc">下次巡检：{{ formatTime(maintenance.nextRunAtUtc, '-') }}</span>
-          <span v-if="maintenance.lastRunAtUtc">
-            上次结果：{{ maintenance.checkedCount }} 个，正常 {{ maintenance.healthyCount }}，
-            已恢复 {{ maintenance.recoveredCount }}，异常 {{ maintenance.failedCount }}
-          </span>
-        </div>
-        <div v-if="maintenance.lastError" class="maintenance-error">
-          最近错误：{{ maintenance.lastError }}
-        </div>
-      </div>
+      <div v-if="wgcfError || wgcfStatus?.reason" class="runtime-error" role="status">{{ wgcfError || wgcfStatus?.reason }}</div>
     </el-card>
 
-    <WgcfWarpPanel ref="wgcfWarpPanel" @changed="loadProxies(false)" @availability="lightweightWarpAvailable = $event" />
+    <WgcfWarpPanel ref="wgcfWarpPanel" @changed="loadProxies(false)" @state="updateWgcfState" />
+    <ProxyBoundAccountsDialog ref="boundAccountsDialog" @changed="refreshBindings" />
 
     <el-dialog
       v-model="globalProxyDialog.visible"
@@ -135,7 +98,7 @@
                 v-model="globalProxyDialog.form.proxyId"
                 class="full"
                 filterable
-                placeholder="选择普通代理、外部 WireGuard WARP、Resin 或受管 WARP"
+                placeholder="选择普通代理、外部 WireGuard WARP 或 Resin"
               >
                 <el-option-group
                   v-for="group in globalProxyGroups"
@@ -329,7 +292,7 @@
         v-loading="loading"
         :data="filteredProxies"
         stripe
-        row-key="id"
+        row-key="rowKey"
         class="proxy-table"
         @selection-change="onProxySelectionChange"
       >
@@ -337,12 +300,12 @@
         <el-table-column label="名称" min-width="150">
           <template #default="{ row }">
             <div class="cell-main">{{ row.name }}</div>
-            <div class="cell-sub">#{{ row.id }}</div>
+            <div class="cell-sub">{{ row.id ? `#${row.id}` : '尚未生成代理' }}</div>
           </template>
         </el-table-column>
         <el-table-column label="类型" width="100">
           <template #default="{ row }">
-            <el-tag :type="kindTagType(row.kind)" size="small">{{ kindLabel(row.kind) }}</el-tag>
+            <el-tag :type="kindTagType(row.kind)" size="small">{{ row.managedWgcfProfile ? 'WARP' : kindLabel(row.kind) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="协议" width="100">
@@ -363,20 +326,19 @@
         </el-table-column>
         <el-table-column label="代理地址" min-width="190">
           <template #default="{ row }">
-            <div class="monospace">{{ row.host }}:{{ row.port }}</div>
+            <div class="monospace">{{ row.host && row.port ? `${row.host}:${row.port}` : '等待生成' }}</div>
             <div v-if="row.username" class="cell-sub">用户：{{ row.username }}</div>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="92">
+        <el-table-column label="状态" min-width="150">
           <template #default="{ row }">
-            <template v-if="row.kind === 'warp'">
-              <el-tooltip :content="warpRuntimeHelp(row)" placement="top">
-                <el-tag :type="warpRuntimeStatusType(row.warpRuntimeStatus)" size="small">
-                  {{ warpRuntimeStatusLabel(row.warpRuntimeStatus) }}
-                </el-tag>
-              </el-tooltip>
-              <div class="cell-sub">期望{{ row.isEnabled ? '启用' : '停用' }}</div>
+            <template v-if="row.wgcfProfile">
+              <el-tag :type="row.wgcfProfile.phase === 'failed' ? 'danger' : row.wgcfProfile.phase === 'ready' ? 'success' : 'info'" size="small">{{ wgcfPhaseLabel(row.wgcfProfile) }}</el-tag>
+              <div class="cell-sub">{{ wgcfRuntimeLabel(row.wgcfProfile.runtime) }}</div>
+              <div class="cell-sub">{{ row.wgcfProfile.desired ? '期望运行' : '期望停止' }}</div>
             </template>
+            <el-tag v-else-if="row.managedWgcfProfile" type="warning" size="small">运行状态未读取</el-tag>
+            <el-tag v-else-if="row.kind === 'warp'" type="warning" size="small">旧出口待迁移</el-tag>
             <el-tag v-else :type="row.isEnabled ? 'success' : 'info'" size="small">
               {{ row.isEnabled ? '已启用' : '已停用' }}
             </el-tag>
@@ -400,7 +362,7 @@
               <span>{{ row.egressIsp || '未知' }}</span>
             </div>
             <el-tag
-              v-if="row.kind === 'warp'"
+              v-if="row.managedWgcfProfile || row.kind === 'wireguard_warp'"
               class="warp-egress-tag"
               :type="warpProxyStatusType(row.warpStatus)"
               size="small"
@@ -419,12 +381,7 @@
               </el-tag>
             </el-tooltip>
             <div v-if="row.lastTestedAtUtc" class="cell-sub">{{ formatTime(row.lastTestedAtUtc, '-') }}</div>
-            <div v-if="row.kind === 'warp' && (row.warpConsecutiveFailures ?? 0) > 0" class="cell-sub failure-count">
-              连续失败 {{ row.warpConsecutiveFailures }} 次
-            </div>
-            <div v-if="row.kind === 'warp' && row.warpLastRecoveredAtUtc" class="cell-sub">
-              最近恢复 {{ formatTime(row.warpLastRecoveredAtUtc, '-') }}
-            </div>
+            <div v-if="row.lastError" class="cell-sub failure-count">{{ row.lastError }}</div>
           </template>
         </el-table-column>
         <el-table-column label="使用情况" width="110" align="center">
@@ -433,35 +390,47 @@
             <el-tag :type="proxyIsUsed(row) ? 'success' : 'info'" size="small">
               {{ proxyIsUsed(row) ? '使用中' : '未使用' }}
             </el-tag>
-            <div class="cell-sub">{{ proxyUsageCount(row) }} 个账号</div>
+            <el-button v-if="row.managedWgcfProfile && row.id > 0" link type="primary" @click="boundAccountsDialog?.open(row)">{{ proxyUsageCount(row) }} 个账号</el-button>
+            <div v-else class="cell-sub">{{ proxyUsageCount(row) }} 个账号</div>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="158" fixed="right">
           <template #default="{ row }">
-            <div v-if="!row.managedWgcfProfile" class="row-actions">
+            <div v-if="row.wgcfProfile" class="row-actions">
+              <el-tooltip v-if="row.wgcfProfile.phase === 'failed'" content="继续创建此出口" placement="top">
+                <el-button link type="warning" :icon="RefreshRight" :loading="wgcfBusy(row.wgcfProfile)" :disabled="wgcfUnavailable(row.wgcfProfile)" aria-label="继续创建此出口" @click="wgcfWarpPanel?.operate(row.wgcfProfile, 'resume')" />
+              </el-tooltip>
+              <el-tooltip v-else-if="!row.wgcfProfile.desired" content="启动出口" placement="top">
+                <el-button link type="success" :icon="VideoPlay" :loading="wgcfBusy(row.wgcfProfile)" :disabled="wgcfUnavailable(row.wgcfProfile) || !row.wgcfProfile.generated || row.wgcfProfile.phase === 'creating'" aria-label="启动出口" @click="wgcfWarpPanel?.operate(row.wgcfProfile, 'start')" />
+              </el-tooltip>
+              <el-tooltip v-else :content="row.accountCount > 0 ? '请先点击已绑定账号解绑或换绑代理' : '停止出口'" placement="top">
+                <el-button link type="warning" :icon="SwitchButton" :loading="wgcfBusy(row.wgcfProfile)" :disabled="wgcfUnavailable(row.wgcfProfile) || row.accountCount > 0 || row.wgcfProfile.phase === 'creating'" aria-label="停止出口" @click="wgcfWarpPanel?.operate(row.wgcfProfile, 'stop')" />
+              </el-tooltip>
+              <el-tooltip content="检测 WARP 出口" placement="top">
+                <el-button link type="primary" :icon="Connection" :disabled="wgcfUnavailable(row.wgcfProfile) || !row.wgcfProfile.desired || row.wgcfProfile.runtime !== 'listening' || row.wgcfProfile.phase !== 'ready'" aria-label="检测 WARP 出口" @click="wgcfWarpPanel?.operate(row.wgcfProfile, 'test')" />
+              </el-tooltip>
+              <el-tooltip v-if="row.accountCount > 0" content="已绑定账号" placement="top">
+                <el-button link type="primary" :icon="User" :disabled="row.id <= 0" aria-label="已绑定账号" @click="boundAccountsDialog?.open(row)" />
+              </el-tooltip>
+              <el-tooltip v-else content="绑定账号" placement="top">
+                <el-button link type="primary" :icon="User" :disabled="!wgcfWarpPanel?.canBind(row.wgcfProfile)" aria-label="绑定账号" @click="wgcfWarpPanel?.openBind(row.wgcfProfile)" />
+              </el-tooltip>
+            </div>
+            <el-button v-else-if="row.managedWgcfProfile" link type="primary" :icon="User" :disabled="row.id <= 0" @click="boundAccountsDialog?.open(row)">已绑定账号</el-button>
+            <span v-else-if="row.kind === 'warp'" class="cell-sub">请迁移至 WARP 新出口</span>
+            <div v-else class="row-actions">
               <el-tooltip content="检测出口 IP（不重启）" placement="top">
                 <el-button
                   link
                   type="primary"
                   :icon="VideoPlay"
                   :loading="testingIds.has(row.id)"
-                  :disabled="refreshingAllWarps || testingIds.has(row.id) || refreshingIds.has(row.id) || deletingIds.has(row.id) || !row.isEnabled"
+                  :disabled="testingIds.has(row.id) || deletingIds.has(row.id) || !row.isEnabled"
                   title="检测出口 IP"
                   @click="testProxy(row)"
                 />
               </el-tooltip>
-              <el-tooltip v-if="row.kind === 'warp'" content="重启并恢复此 WARP" placement="top">
-                <el-button
-                  link
-                  type="warning"
-                  :icon="RefreshRight"
-                  :loading="refreshingIds.has(row.id)"
-                  :disabled="warpUnavailable || refreshingAllWarps || refreshingIds.has(row.id) || testingIds.has(row.id) || deletingIds.has(row.id) || !row.isEnabled"
-                  title="重启并恢复此 WARP"
-                  @click="refreshWarp(row)"
-                />
-              </el-tooltip>
-              <el-tooltip v-if="row.kind !== 'warp'" content="编辑代理" placement="top">
+              <el-tooltip content="编辑代理" placement="top">
                 <el-button
                   link
                   type="primary"
@@ -477,17 +446,16 @@
                   type="danger"
                   :icon="Delete"
                   :loading="deletingIds.has(row.id)"
-                  :disabled="refreshingAllWarps || deletingIds.has(row.id) || testingIds.has(row.id) || refreshingIds.has(row.id)"
+                  :disabled="deletingIds.has(row.id) || testingIds.has(row.id)"
                   title="删除代理"
                   @click="removeProxy(row)"
                 />
               </el-tooltip>
             </div>
-            <el-tag v-else size="small" effect="plain">轻量 WARP 受管</el-tag>
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty :description="proxies.length ? '当前筛选下没有代理' : '暂无代理'" />
+          <el-empty :description="proxyRows.length ? '当前筛选下没有代理' : '暂无代理'" />
         </template>
       </el-table>
     </el-card>
@@ -772,6 +740,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   CirclePlus,
   CollectionTag,
+  Connection,
   Delete,
   Edit,
   FolderOpened,
@@ -779,11 +748,14 @@ import {
   Refresh,
   RefreshRight,
   Setting,
+  SwitchButton,
+  User,
   Upload,
   VideoPlay,
 } from '@element-plus/icons-vue'
 import { panelApi } from '@/api/panel'
 import WgcfWarpPanel from '@/components/WgcfWarpPanel.vue'
+import ProxyBoundAccountsDialog from '@/components/ProxyBoundAccountsDialog.vue'
 import type {
   GlobalProxySettings,
   NetworkEgress,
@@ -794,8 +766,10 @@ import type {
   GlobalProxySourceMode,
   SaveOutboundProxyRequest,
   SaveGlobalProxySettingsRequest,
-  WarpRuntimeStatus,
+  WgcfRuntimeStatus,
+  WgcfProfile,
 } from '@/api/types'
+import { mergeProxyRows, wgcfPhaseLabel, wgcfRuntimeLabel } from '@/utils/proxyRows'
 import { formatTime } from '@/utils/format'
 import { ipVersionLabel, isWarpConnected, warpStatusLabel } from '@/utils/networkEgress'
 
@@ -812,20 +786,17 @@ const panelEgressError = ref('')
 const globalProxy = ref<GlobalProxySettings | null>(null)
 const globalProxyLoading = ref(false)
 const globalProxyError = ref('')
-const warpStatus = ref<WarpRuntimeStatus | null>(null)
-const warpStatusError = ref('')
+const wgcfStatus = ref<WgcfRuntimeStatus | null>(null)
+const wgcfError = ref('')
 const proxyCategoryLoading = ref(false)
 const testingIds = reactive(new Set<number>())
-const refreshingIds = reactive(new Set<number>())
 const deletingIds = reactive(new Set<number>())
 const batchDeleting = ref(false)
-const refreshingAllWarps = ref(false)
 const AUTO_STATUS_REFRESH_MS = 30_000
 let autoStatusRefreshTimer: ReturnType<typeof setInterval> | null = null
 let proxyListOperationToken = 0
 let panelEgressOperationToken = 0
 let globalProxyOperationToken = 0
-let warpStatusOperationToken = 0
 let proxySaveOperationToken = 0
 let proxyImportOperationToken = 0
 
@@ -913,21 +884,18 @@ const importDialog = reactive({
 })
 
 const wgcfWarpPanel = ref<InstanceType<typeof WgcfWarpPanel> | null>(null)
-const lightweightWarpAvailable = ref(false)
-
-const warpUnavailable = computed(() => !warpStatus.value
-  || !warpStatus.value.platformSupported
-  || !warpStatus.value.enabled
-  || !warpStatus.value.dockerAvailable)
-
-const maintenance = computed(() => warpStatus.value?.maintenance ?? null)
-const hasEnabledWarp = computed(() => proxies.value.some((proxy) => proxy.kind === 'warp' && proxy.isEnabled))
-const hasLegacyWarp = computed(() => proxies.value.some((proxy) => proxy.kind === 'warp'))
+const boundAccountsDialog = ref<InstanceType<typeof ProxyBoundAccountsDialog> | null>(null)
+async function refreshBindings() {
+  const results = await Promise.allSettled([loadProxies(false), wgcfWarpPanel.value?.loadStatus()])
+  if (results.some((result) => result.status === 'rejected')) ElMessage.warning('账号绑定已处理，代理列表刷新失败，请手动刷新')
+}
+const lightweightWarpAvailable = computed(() => !!wgcfStatus.value?.available && !wgcfError.value)
+const proxyRows = computed(() => mergeProxyRows(proxies.value, wgcfStatus.value?.profiles ?? []))
 const usageCounts = computed(() => {
-  const used = proxies.value.filter(proxyIsUsed).length
-  return { all: proxies.value.length, used, unused: proxies.value.length - used }
+  const used = proxyRows.value.filter(proxyIsUsed).length
+  return { all: proxyRows.value.length, used, unused: proxyRows.value.length - used }
 })
-const filteredProxies = computed(() => proxies.value.filter((proxy) => {
+const filteredProxies = computed(() => proxyRows.value.filter((proxy) => {
   if (usageFilter.value === 'used' && !proxyIsUsed(proxy)) return false
   if (usageFilter.value === 'unused' && proxyIsUsed(proxy)) return false
   if (categoryFilter.value === 'uncategorized' && proxy.category) return false
@@ -938,7 +906,6 @@ const globalProxyGroups = computed(() => ([
   { kind: 'wireguard_warp' as const, label: '外部 WireGuard WARP', items: proxies.value.filter((proxy) => proxy.kind === 'wireguard_warp' && !proxy.managedWgcfProfile) },
   { kind: 'manual' as const, label: '普通代理', items: proxies.value.filter((proxy) => proxy.kind === 'manual') },
   { kind: 'resin' as const, label: 'Resin 动态代理', items: proxies.value.filter((proxy) => proxy.kind === 'resin') },
-  { kind: 'warp' as const, label: '受管 WARP', items: proxies.value.filter((proxy) => proxy.kind === 'warp') },
 ]).filter((group) => group.items.length > 0))
 const globalSelectedProxy = computed(() => proxies.value.find(
   (proxy) => proxy.id === globalProxyDialog.form.proxyId,
@@ -966,32 +933,6 @@ const globalProxyHelp = computed(() => {
         : '当前引用的已有代理不可用，请重新选择'
   }
   return `${protocolLabel(globalProxy.value.protocol)} · ${globalProxy.value.server}:${globalProxy.value.port}`
-})
-
-const maintenanceStatusText = computed(() => {
-  if (!maintenance.value?.enabled) return '自动维护未启用'
-  return maintenance.value.running ? '正在自动巡检' : '自动维护已启用'
-})
-
-const maintenanceStatusType = computed(() => {
-  if (!maintenance.value?.enabled) return 'info'
-  if (maintenance.value.lastError || maintenance.value.failedCount > 0) return 'warning'
-  return 'success'
-})
-
-const warpStatusText = computed(() => {
-  if (warpStatusError.value) return '检测失败'
-  if (!warpStatus.value) return '检测中'
-  if (!warpStatus.value.platformSupported) return '平台不支持'
-  if (!warpStatus.value.enabled) return '未启用'
-  if (!warpStatus.value.dockerAvailable) return 'Docker 不可用'
-  return warpStatus.value.dockerVersion ? `可用 · ${warpStatus.value.dockerVersion}` : '可用'
-})
-
-const warpStatusType = computed(() => {
-  if (warpStatusError.value) return 'danger'
-  if (!warpStatus.value) return 'info'
-  return warpUnavailable.value ? 'danger' : 'success'
 })
 
 const panelEgressText = computed(() => {
@@ -1026,7 +967,7 @@ function normalizeOptional(value?: string | null) {
 function kindLabel(kind: ProxyKind) {
   if (kind === 'wireguard_warp') return 'WireGuard WARP'
   if (kind === 'resin') return 'Resin'
-  if (kind === 'warp') return '受管 WARP'
+  if (kind === 'warp') return '旧 WARP'
   return '普通'
 }
 
@@ -1041,41 +982,6 @@ function protocolLabel(protocol: ProxyProtocol) {
   if (protocol === 'socks5') return 'SOCKS5'
   if (protocol === 'mtproto') return 'MTProto'
   return 'HTTP'
-}
-
-function formatDuration(minutes: number) {
-  if (minutes > 0 && minutes % 1440 === 0) return `${minutes / 1440} 天`
-  if (minutes > 0 && minutes % 60 === 0) return `${minutes / 60} 小时`
-  return `${minutes} 分钟`
-}
-
-function warpRuntimeStatusLabel(status?: string | null) {
-  const value = status?.trim().toLowerCase()
-  if (value === 'active' || value === 'healthy') return '正常'
-  if (value === 'degraded' || value === 'unhealthy') return '异常'
-  if (value === 'recovering' || value === 'restarting') return '恢复中'
-  if (value === 'starting' || value === 'creating') return '启动中'
-  if (value === 'stopped') return '已停止'
-  if (value === 'missing') return '容器丢失'
-  if (value === 'failed' || value === 'cleanup_pending') return '故障'
-  if (value === 'deleting' || value === 'deleted') return '删除中'
-  return '状态未知'
-}
-
-function warpRuntimeStatusType(status?: string | null) {
-  const value = status?.trim().toLowerCase()
-  if (value === 'active' || value === 'healthy') return 'success'
-  if (value === 'recovering' || value === 'restarting' || value === 'starting' || value === 'creating') return 'warning'
-  if (value === 'degraded' || value === 'unhealthy' || value === 'missing' || value === 'failed' || value === 'cleanup_pending') return 'danger'
-  return 'info'
-}
-
-function warpRuntimeHelp(proxy: OutboundProxy) {
-  const status = warpRuntimeStatusLabel(proxy.warpRuntimeStatus)
-  const failureText = (proxy.warpConsecutiveFailures ?? 0) > 0
-    ? `，已连续失败 ${proxy.warpConsecutiveFailures} 次`
-    : ''
-  return `最近维护状态：${status}${failureText}。期望状态：${proxy.isEnabled ? '启用' : '停用'}。`
 }
 
 function testStatusLabel(status?: string | null) {
@@ -1133,7 +1039,7 @@ function categoryProxyCount(category: ProxyCategory) {
 }
 
 function isSelectableProxy(proxy: OutboundProxy) {
-  return !proxy.managedWgcfProfile
+  return proxy.id > 0 && !proxy.managedWgcfProfile && proxy.kind !== 'warp'
 }
 
 function onProxySelectionChange(rows: OutboundProxy[]) {
@@ -1223,80 +1129,12 @@ async function loadGlobalProxy(showLoading = true) {
   }
 }
 
-async function loadWarpStatus() {
-  const operationToken = ++warpStatusOperationToken
-  warpStatusError.value = ''
-  try {
-    const result = await panelApi.warpStatus()
-    if (operationToken === warpStatusOperationToken) warpStatus.value = result
-  } catch (error) {
-    if (operationToken === warpStatusOperationToken) {
-      warpStatus.value = null
-      warpStatusError.value = error instanceof Error ? error.message : '无法读取 WARP 运行状态'
-    }
-  }
-}
-
 async function refreshAll() {
-  await Promise.allSettled([loadProxies(), loadProxyCategories(), loadGlobalProxy(), loadWarpStatus()])
-}
-
-async function refreshWarp(proxy: OutboundProxy) {
-  if (refreshingIds.has(proxy.id) || refreshingAllWarps.value) return
-  if ((proxy.accountCount ?? 0) > 0) {
-    try {
-      await ElMessageBox.confirm(
-        `刷新“${proxy.name}”会让已绑定的 ${proxy.accountCount} 个账号短暂重连；账号不会回退直连。是否继续？`,
-        '确认刷新 WARP',
-        { type: 'warning', confirmButtonText: '刷新并复测', cancelButtonText: '取消' },
-      )
-    } catch {
-      return
-    }
-  }
-
-  refreshingIds.add(proxy.id)
-  try {
-    const result = await panelApi.refreshWarpProxy(proxy.id)
-    if (result.success) ElMessage.success(result.summary || `WARP“${proxy.name}”已恢复`)
-    else ElMessage.error(result.error || result.summary || `WARP“${proxy.name}”恢复失败`)
-  } finally {
-    await Promise.allSettled([loadProxies(), loadWarpStatus()])
-    refreshingIds.delete(proxy.id)
-  }
-}
-
-async function refreshAllWarps() {
-  if (refreshingAllWarps.value || refreshingIds.size > 0 || !hasEnabledWarp.value) return
-  const enabledWarps = proxies.value.filter((proxy) => proxy.kind === 'warp' && proxy.isEnabled)
-  const affectedAccounts = enabledWarps.reduce((total, proxy) => total + (proxy.accountCount ?? 0), 0)
-  const accountHint = affectedAccounts > 0
-    ? `，${affectedAccounts} 个绑定账号会短暂重连，但不会回退直连`
-    : ''
-  try {
-    await ElMessageBox.confirm(
-      `将依次重启并复测 ${enabledWarps.length} 个 WARP${accountHint}。是否继续？`,
-      '确认刷新全部 WARP',
-      { type: 'warning', confirmButtonText: '全部刷新', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-
-  refreshingAllWarps.value = true
-  try {
-    const result = await panelApi.refreshAllWarpProxies()
-    const summary = `已处理 ${result.checked} 个：正常 ${result.healthy}，恢复 ${result.recovered}，失败 ${result.failed}`
-    if (result.failed > 0) ElMessage.warning(summary)
-    else ElMessage.success(summary)
-  } finally {
-    await Promise.allSettled([loadProxies(), loadWarpStatus()])
-    refreshingAllWarps.value = false
-  }
+  await Promise.allSettled([loadProxies(), loadProxyCategories(), loadGlobalProxy(), wgcfWarpPanel.value?.loadStatus()])
 }
 
 function openBatchCategory() {
-  if (selectedProxies.value.length === 0 || batchCategoryDialog.saving) return
+  if (selectedProxies.value.length === 0 || batchCategoryDialog.saving || selectedProxies.value.some((proxy) => !isSelectableProxy(proxy))) return
   batchCategoryDialog.proxyIds = selectedProxies.value.map((proxy) => proxy.id)
   batchCategoryDialog.categoryId = null
   batchCategoryDialog.visible = true
@@ -1493,8 +1331,8 @@ async function saveGlobalProxy() {
         ElMessage.warning('请选择一个已有代理')
         return
       }
-      if (selected.managedWgcfProfile) {
-        ElMessage.warning('轻量 WARP 出口只支持绑定单个已有账号')
+      if (selected.managedWgcfProfile || selected.kind === 'warp') {
+        ElMessage.warning(selected.kind === 'warp' ? '旧 WARP 已停用，请迁移至新出口' : 'WARP 出口只支持单个账号独占使用')
         return
       }
       if (!selected.isEnabled) {
@@ -1576,7 +1414,7 @@ function closeProxyDialog() {
 }
 
 function openEdit(proxy: OutboundProxy) {
-  if (proxyDialog.saving || proxy.managedWgcfProfile) return
+  if (proxyDialog.saving || !isSelectableProxy(proxy)) return
   proxySaveOperationToken += 1
   proxyDialog.id = proxy.id
   proxyDialog.hasPassword = Boolean(proxy.hasPassword)
@@ -1702,7 +1540,7 @@ async function testProxy(proxy: OutboundProxy) {
 }
 
 async function removeProxy(proxy: OutboundProxy) {
-  if (deletingIds.has(proxy.id) || proxy.managedWgcfProfile) return
+  if (deletingIds.has(proxy.id) || !isSelectableProxy(proxy)) return
   try {
     await ElMessageBox.confirm(
       `确定删除代理“${proxy.name}”吗？已绑定账号需要先切换为直连或其他代理。`,
@@ -1746,18 +1584,29 @@ async function importProxyText() {
   }
 }
 
+function updateWgcfState(status: WgcfRuntimeStatus | null, error: string) {
+  wgcfStatus.value = status
+  wgcfError.value = error
+}
+
+function wgcfUnavailable(profile: WgcfProfile) {
+  return wgcfWarpPanel.value?.operationUnavailable(profile) ?? true
+}
+
+function wgcfBusy(profile: WgcfProfile) {
+  return wgcfWarpPanel.value?.busyProfiles.has(profile.profile) ?? false
+}
+
 function openLightweightWarpCreate() {
   if (lightweightWarpAvailable.value) wgcfWarpPanel.value?.openCreate()
 }
 
 onMounted(() => {
-  void Promise.allSettled([loadProxies(), loadProxyCategories(), loadPanelEgress(), loadGlobalProxy(), loadWarpStatus()])
+  void Promise.allSettled([loadProxies(), loadProxyCategories(), loadPanelEgress(), loadGlobalProxy()])
   autoStatusRefreshTimer = setInterval(() => {
     if (document.visibilityState !== 'visible'
-      || refreshingAllWarps.value
-      || refreshingIds.size > 0
       || deletingIds.size > 0) return
-    void Promise.allSettled([loadProxies(false), loadWarpStatus()])
+    void loadProxies(false)
   }, AUTO_STATUS_REFRESH_MS)
 })
 
@@ -1789,7 +1638,6 @@ onBeforeUnmount(() => {
 
 .network-main,
 .network-value,
-.warp-runtime,
 .form-options {
   display: flex;
   align-items: center;
@@ -1831,35 +1679,11 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 
-.warp-runtime {
-  gap: 8px;
-  white-space: nowrap;
-}
-
 .runtime-error {
   margin-top: 8px;
   text-align: right;
 }
 
-.warp-maintenance {
-  display: grid;
-  gap: 7px;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--tp-border);
-  color: var(--tp-muted);
-  font-size: 12px;
-}
-
-.maintenance-state,
-.maintenance-schedule {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-}
-
-.maintenance-error,
 .failure-count {
   color: var(--el-color-danger);
 }
@@ -2022,11 +1846,6 @@ onBeforeUnmount(() => {
     grid-template-columns: 1fr;
   }
 
-  .warp-runtime {
-    width: 100%;
-    justify-content: space-between;
-  }
-
   .proxy-list-header,
   .proxy-list-actions {
     align-items: stretch;
@@ -2043,11 +1862,5 @@ onBeforeUnmount(() => {
     margin-left: 0;
   }
 
-  .maintenance-state,
-  .maintenance-schedule {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 6px;
-  }
 }
 </style>

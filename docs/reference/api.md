@@ -213,9 +213,10 @@ Telegram 的限流、权限和 Session 等业务错误不会重试，避免扩�
 `proxyStrategy=direct|global|existing|warp_pool|warp_per_account`；`existing` 还必须提供
 `proxyId`。
 
-`warp_pool` 只自动分配代理管理中已存在、已启用且状态为 `active` 的 WARP，按绑定账号数升序、
-代理 ID 升序选择。它不会创建容器或数据卷，也无需提供 `proxyId`。没有候选项或候选项都在
-维护/被其他首次连接流程占用时，请求会在连接 Telegram 前失败。
+v1.31.82 起，`warp_pool` 只自动分配带 `managedWgcfProfile` 的空闲轻量出口：必须已启用、
+`ready`、监听正常、检测成功，且没有账号或全局引用。每个出口仅分配给一个账号，并在首次
+连接期间持有独占租约；旧 `kind=warp` 记录不是候选。该策略无需 `proxyId`，不会创建新出口，
+没有候选或候选被占用时在连接 Telegram 前失败，不回退直连。
 
 `warp_per_account` 从 v1.31.81 起在每个账号首次 Telegram 验证前创建一个轻量 WARP，并在账号成功入库后把
 新 `ProxyId` 绑定到账号。Zip 和 Session 文件导入单次最多 10 个账号，StringSession 固定 1 个；
@@ -273,16 +274,14 @@ proxyText: http://user-a:password-a@proxy-a.example.com:8080
 - `POST /api/panel/settings/global-proxy`：启用、修改或关闭账号全局代理并清理客户端缓存
 - `GET /api/panel/proxies`：代理列表
 - `GET /api/panel/proxies?usage=used|unused&categoryId={id}`：按使用状态或分类筛选代理
+- `GET /api/panel/proxies/{id}/accounts?page=1&pageSize=50`：分页查看该代理的专属绑定账号
 - `GET/POST/PUT/DELETE /api/panel/proxy-categories[/{id}]`：查询和管理代理分类
 - `POST /api/panel/proxies/batch/category`：批量设置代理分类
 - `POST /api/panel/proxies/batch/delete`：逐项删除所选代理并返回成功、失败数及每项原因
 - `POST /api/panel/proxies`：新增普通代理或 Resin
 - `PUT /api/panel/proxies/{id}`：修改代理
 - `POST /api/panel/proxies/{id}/test`：检测代理出口
-- `GET /api/panel/proxies/warp/status`：受管 WARP 运行环境
 - `POST /api/panel/proxies/warp`：v1.31.81 起创建轻量 WARP，固定 SOCKS5；返回 202 档案状态
-- `POST /api/panel/proxies/{id}/warp/refresh`：重启并复测单个受管 WARP
-- `POST /api/panel/proxies/warp/refresh-all`：依次重启并复测全部期望启用的 WARP
 - `POST /api/panel/accounts/{id}/proxy`：切换单个账号路由
 - `POST /api/panel/accounts/batch/proxy`：批量切换账号路由
 - `GET /api/panel/accounts/{id}/proxy/egress`：检测账号实际出口
@@ -292,6 +291,28 @@ proxyText: http://user-a:password-a@proxy-a.example.com:8080
 `POST /api/panel/settings/global-proxy` 使用 `sourceMode=manual|existing`。`existing` 模式
 必须提供 `proxyId`，服务端只保存引用并在运行时解析代理；不会把 WARP 或 Resin 的连接
 凭据复制到全局配置。
+
+v1.31.82 起，`GET /api/panel/proxies/{id}/accounts` 在面板认证后可用，仅查询
+`ProxyId == id` 的专属绑定账号，不包含仅继承全局代理的账号。返回
+`{ items, total, page, pageSize }`，按账号内部 `id` 升序分页；`page` 默认 1、最小 1，
+`pageSize` 默认 50、限制在 1～200，超出范围会被钳制。超出最后一页返回空 `items`，
+但 `total` 保留当前总数。代理不存在返回 `404` 和中文 `message`。
+每项仅包含 `id`、`displayNumber`、`remark`、`nickname`、`phoneLastFour`、`proxyId`、
+`useGlobalProxy`；手机号不足四位时 `phoneLastFour` 为空，不返回完整手机号、Session、
+API Hash 或二级密码。此端点只读，不触发账号连接或改变路由。
+
+代理页的解绑、全局代理切换和换绑复用 `POST /api/panel/accounts/{id}/proxy`，分别使用
+`strategy=direct|global|existing`，并提交列表快照中的 `expectedProxyId` 和
+`expectedUseGlobalProxy`；换绑指定代理时同时传入目标 `proxyId`，必须一次提交完成，
+不能先解绑再绑定。返回 `409` 时说明绑定已变化，应刷新列表后重新选择，不能覆盖新绑定。
+验收以专属账号正确分页、敏感字段未返回、解绑后刷新列表移除该账号为准；若列表与页面
+使用数不同，先区分全局继承人数与专属绑定人数。回滚旧版本会移除该查看端点和快捷操作，
+已完成的路由切换需重新绑定原代理恢复。
+
+v1.31.82 已撤除旧 `GET /proxies/warp/status`、`POST /proxies/{id}/warp/refresh` 与
+`POST /proxies/warp/refresh-all`，旧客户端必须改用下文轻量档案 API。历史 `kind=warp`
+记录不再允许用于新绑定或实际账号/全局路由；残留引用在连接前失败，不降级直连。
+内置轻量出口同样不能作为全局代理，但允许一个账号的专属绑定。
 
 ## 频道、群组和 Bot
 
@@ -441,7 +462,14 @@ Telegram 限流和 Session/代理状态。该功能不引入数据库迁移，�
 需要给外部系统调用时，优先使用模块的 `MapEndpoints` 明确设计鉴权、限流和响应模型，
 不要直接把管理 Cookie 接口暴露到公网。
 
-## 轻量 WARP 管理 API（v1.31.81）
+## 轻量 WARP 管理 API（v1.31.82）
+
+档案响应的 `poolEligible` 表示当前可被空闲池领取：排除内部临时归属、停止意图、
+已有占用或账号绑定，且要求运行及联网检测就绪。这只是瞬时快照，领取时仍原子校验，
+不能作为客户端自行复用出口的授权。
+
+v1.31.82 的旧 Razor 登录/导入兼容页也使用相同的资格快照；运行器不可用、档案读取失败、
+代理 ID 不匹配或存在启用的全局引用时，不计入页面空闲池。本次修复不改变公开 API 合同。
 
 以下接口均位于已登录的 `/api/panel` 下，不接受或返回 WARP 私钥、注册
 Token、SOCKS 密码或上游原始输出。
@@ -450,17 +478,23 @@ Token、SOCKS 密码或上游原始输出。
   `registered`、`generated`、`desired`、`runtime`、`proxyId`、`accountCount`、检测状态和
   脱敏错误。`runtime=listening` 只代表本地监听，不能替代 `testStatus=ok`。
 - `POST /proxies/wgcf`：请求体为 `{ requestId, name, acceptTerms }`。`requestId` 为 UUID，
-  `acceptTerms` 必须为 `true`；返回已持久化的档案状态，后续以 GET 读取创建进度。同一 requestId 幂等。
+  `acceptTerms` 必须为 `true`；`name` 可为空，服务会按 requestId 生成稳定的“轻量 WARP-XXXXXXXX”
+  名称。返回已持久化的档案状态，后续以 GET 读取创建进度。同一 requestId 幂等。登录、导入和
+  账号绑定的创建流程仍须由调用方显式确认条款。
 - `POST /proxies/wgcf/{profile}/resume`、`start`、`stop`、`test`：恢复失败档案、切换期望
   启停或执行出口检测。停止被账号引用的出口返回冲突，调用方需先改账号路由。
 
 常规代理 DTO 新增可空 `managedWgcfProfile`。带该字段的代理只能通过上述专用接口维护，
 不能用常规代理编辑、删除、批量或全局代理 API 修改。
 
+统一代理列表由 `GET /proxies` 和 `GET /proxies/wgcf` 合并，以
+`managedWgcfProfile` / `profile` 关联。未落库的创建中或失败档案仍需显示；同一档案
+不能因已有 `proxyId` 而重复成两行。页面合表不改变 API 的运行态来源或单账号占用合同。
+
 账号登录（手机和二维码）、导入（表单或 StringSession）及单/批账号代理绑定的
 `warp_per_account` 新增 `acceptWarpTerms` 与可选 `warpRequestId`，前者必须显式为 `true`。
 `warpRequestId` 省略时由服务端生成；提供时必须为非零 UUID，空字符串、空白和非法值返回 400。
 登录清理失败会保留会话占用供后台重试；取消或重置返回明确失败，不能视为出口已停止。
 旧 `POST /proxies/warp` 请求改为 `{name, requestId, acceptWarpTerms, protocol:"socks5"}`，
-返回档案而非代理 DTO，通过 `GET /proxies/wgcf` 等待完成。旧容器维护接口仍可使用。
+返回档案而非代理 DTO，通过 `GET /proxies/wgcf` 等待完成。旧容器状态与维护接口已撤除。
 首次连接期间的出口不可由其它流程绑定、恢复或启停；内部归属 token 不接受公开提交。
