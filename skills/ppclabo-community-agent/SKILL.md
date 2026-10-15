@@ -130,6 +130,46 @@ description: Разработка внешнего модуля PPC Labo Communi
 
 До написания Community Agent сначала спросить автора об актуальных `pro.channel-push`, `pro.bot-monitor-notify`, `pro.sync-forward`, `pro.direct-messaging` и наличии отдельного AI/comment/community module. Не предполагать функциональность, которой нет в публичных контрактах.
 
+## Публично засвеченный исходный код модулей автора
+
+В upstream git-history реально сохранился полный код двух семейств модулей. Использовать их прежде всего как точные примеры архитектуры автора; не републиковывать удалённый код без проверки лицензии/разрешения.
+
+### MessageReport — лучший архитектурный donor
+
+Deletion commit: `dfbf86230d066fa67d75b6bd21b116ccf288a10a` от 2026-03-10 (`chore: 删除 message report 模块`).
+Последний parent с полным исходным кодом: `58273b12cde9f2d9bb91ad75475efaf3d114a33b`.
+
+В parent доступны две версии:
+- `src/TelegramPanel.Modules.MessageReport/**`
+- `src/TelegramPanel.Modules.MessageReportTask/**`
+
+Новая версия содержит `manifest.json`, `MessageReportTaskModule.cs`, editor Razor, models, handler, rerun builder, `TelegramMessageReportService.cs` и csproj. Manifest: module id `task.message-report`, version `1.0.0`, host min `1.31.6`.
+
+Архитектура особенно полезна нам:
+- csproj напрямую ссылается на `Modules.Abstractions`, `Core`, `Data` и WTelegram;
+- `ConfigureServices` регистрирует собственный Telegram service, `IModuleTaskHandler` и `IModuleTaskRerunBuilder`;
+- handler получает host services через `host.Services.GetRequiredService<T>()`, использует `IsStillRunningAsync`, пишет progress/config и обрабатывает delay/cancel/error;
+- Telegram service инжектит `AccountTelegramToolsService` + `ITelegramClientPool`, получает raw `WTelegram.Client` и выполняет MTProto методы напрямую.
+
+Это подтверждает, что Core-binding для нашего Community Agent соответствует реальному паттерну самого автора.
+
+### FragmentUsernameChecker
+
+До удаления private modules полный исходник существовал в:
+- `modules/fragment-username-checker/FragmentUsernameChecker.csproj`
+- `manifest.json`
+- `src/FragmentCheckerService.cs`
+- `src/FragmentUsernameCheckerModule.cs`
+- `src/FragmentUsernameTaskHandler.cs`
+- `src/Pages/FragmentUsernamePage.razor`
+- `modules/build-fragment-module.ps1`
+
+Код доступен, например, на parent перед `9c0baab`: `4109a0d383711426f8444a474752d4b21dee1bc4`.
+
+### Что НЕ утекло
+
+После загрузки 143 public PR head refs, поиска по git object database, GitHub code search, нескольким forks, старому release ZIP и старому публичному Docker image `ghcr.io/moeacgx/telegram-panel:sha-4109a0d` backend-исходники/TPM/DLL для `pro.channel-push`, `pro.bot-monitor-notify`, `pro.sync-forward`, `pro.channel-member-gate` и `pro.direct-messaging` не обнаружены. Для них публично сохранились host UI/API/docs contracts, но не implementation.
+
 ## Reference implementations
 
 Использовать как архитектурные доноры, соблюдая лицензии:
