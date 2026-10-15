@@ -2,3 +2,7 @@ services:
   telegram-panel:
     image: telegram-panel-ru:v1.31.88
     pull_policy: never
+    environment:
+      SelfUpdate__Mode: "image"
+      SelfUpdate__Enabled: "false"
+      TELEGRAM_PANEL_UPDATE_MODE: "image"
