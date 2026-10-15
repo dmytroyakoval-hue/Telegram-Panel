@@ -1,77 +1,17 @@
-# Telegram Panel Agent 开发规范
+# Telegram Panel Community Agent workspace
 
-本文件适用于仓库内的 Agent 和维护者。所有代码改动都必须以可验证、可回滚、可交接为目标。
+Before changing code, read:
+- `skills/tgpanel-module-workflow/SKILL.md`
+- `skills/ppclabo-community-agent/SKILL.md`
 
-## 1. 开始工作前
-
-- 先查看 `git status`、当前分支、关联远端和近期提交。
-- 保留用户已有的未提交改动；不要使用 `git reset --hard`、`git checkout --` 或覆盖式清理来处理脏工作区。
-- 修改前确认影响范围、测试入口和需要同步的文档。
-- 涉及部署、主机或凭据时，先阅读私有知识库的 `index.md` 和 `SCHEMA.md`；若文件不存在，说明缺失并仅读取完成任务所需的页面，不输出密钥、密码或 Token。
-
-## 2. 重要改动必须同步开发文档
-
-重要改动包括但不限于：
-
-- 新增、删除或改变用户可见功能、页面、任务创建/编辑行为和默认值；
-- 新增或改变 API、模块宿主 ABI、模块页面合同、数据模型、数据库迁移或持久化格式；
-- 新增或改变配置项、环境变量、Docker Compose 覆盖、代理/WARP 行为、权限和安全边界；
-- 改变部署、升级、回滚、运维检查、运行态字段或故障排查方式；
-- 会影响已有模块、插件、脚本、测试夹具或下游调用方的兼容性修复。
-
-完成上述改动时，必须在同一个提交或同一个 PR 中更新对应开发文档。至少完成以下检查：
-
-1. 在 `docs/developer/` 补充实现约束、接口合同、迁移说明或验收条件。
-2. 在 `docs/reference/` 更新 API、配置、数据结构或环境变量说明。
-3. 在 `docs/getting-started/`、`docs/deployment/` 或 README 更新用户部署和使用步骤。
-4. 新增页面或移动页面时同步维护 `mkdocs.yml` 的 `nav`。
-5. 文档必须写清适用版本、前置条件、成功判据、失败排查和回滚方式；不要只写“已支持”。
-
-如果确认某项改动不需要文档，必须在提交说明或 PR 描述中写出原因。没有文档更新或明确豁免理由的重要改动，不得宣布完成。
-
-## 3. 验证要求
-
-- 前端改动：运行 `pnpm --dir frontend run build` 和 `pnpm --dir frontend test`。
-- .NET 改动：至少运行 `dotnet build TelegramPanel.sln -c Release --no-restore`；涉及测试时运行 `dotnet test TelegramPanel.sln -c Release --no-build` 或对应测试项目。
-- 文档改动：运行 `mkdocs build --strict`，确保链接、导航和 Markdown 结构有效。
-- 部署相关改动：必须完成容器启动、健康接口、登录态接口和本次功能的云端验收，并记录版本、镜像和结果。
-- 测试命令设置最大超时 60 秒；超时或环境缺失必须如实记录，不得将未执行写成通过。
-
-## 4. 唯一发布路径
-
-长期保留的分支只有 `main` 和 `dev`。功能分支使用 `codex/<purpose>` 命名，完成后必须删除。
-
-发布顺序固定为：
-
-```text
-功能分支
-  -> dev
-  -> 构建 ghcr.io/moeacgx/telegram-panel:dev-latest
-  -> 部署云端测试环境
-  -> 自动健康检查 + 本次功能验收
-  -> 记录验收证据
-  -> PR/合并到 main
-  -> main 构建 latest，并按需创建正式 Release
-```
-
-约束如下：
-
-- 禁止绕过 `dev` 直接把功能分支合并到 `main`。
-- `dev` 的镜像构建成功不等于功能验收通过；必须部署后确认容器状态、日志、健康接口、认证接口和实际业务路径。
-- 云端验收失败时，先修复或回滚 `dev`，不得合并 `main`。
-- 合并 `main` 后再删除已合并的本地和远端功能分支；删除前确认没有唯一未保存提交。
-- 清理后只保留 `main`、`dev` 及必要的远端默认引用，不保留历史发布临时分支或废弃 worktree。
-
-云端发布使用 `.github/workflows/deploy-telegram-panel.yml`，默认镜像为 `dev-latest`。部署结果必须至少包含：部署提交 SHA、镜像标签、容器状态、关键日志、`/ui/dashboard`、`/api/panel/auth/me` 和本次改动的验收结果。
-
-正式 Release 说明必须优先服务面板用户，不得直接依赖 GitHub 默认英文 `What's Changed` 作为主要内容。创建或修改发版相关提交、PR 标题、tag 发布说明和 `.github/workflows/release.yml` 时必须遵守：
-
-- Release 正文顶部必须是中文 `## 本次版本主要更新`，变更列表必须位于部署说明和资产说明之前。
-- conventional commit 前缀只用于分类，不得作为用户可见标题原样保留；`fix:`、`feat:`、`release:` 等必须在 Release 条目中剥离。
-- 提交标题、PR squash 标题和 release 类型提交必须写中文业务摘要，例如 `fix: 修复导入分类与设备参数问题`，不得写 `fix: resolve issue sweep` 这类英文泛化标题。
-- Release 分类标题必须中文化，例如 `修复问题`、`新增功能`、`版本发布`、`构建发布`、`文档更新`；完整对比链接标题使用 `完整变更记录`。
-- 如果发布前发现历史英文提交会进入 Release，必须在发版说明生成步骤中补写中文摘要，或在 squash/合并前改成中文标题；不得把“GitHub 会自动生成”作为豁免理由。
-
-## 5. 交接要求
-
-最终汇报必须说明：改动文件、文档入口、已执行命令及结果、部署版本、云端验收结论、合并提交和已清理分支。任何未完成项、环境限制或风险都必须明确列出。
+Rules:
+- Work only inside this development worktree.
+- Never modify `/home/dima/projects/telegram-panel`, `docker-data`, production containers, production databases, or production credentials.
+- Do not deploy, restart production, or change live configuration unless the orchestrator explicitly asks.
+- Prefer an external `.tpm` module over host/core edits.
+- If host/core must change, keep the patch minimal and generic.
+- The host has no local .NET SDK; use an SDK container for compile/test when needed.
+- Preserve the Russian runtime localization architecture.
+- Run targeted tests/builds for every change and report exact commands/results.
+- Do not implement spam, enforcement evasion, CAPTCHA bypass, account farming, or proxy rotation intended to evade Telegram restrictions.
+- For third-party public communities, default to monitoring + AI draft + human approval unless the task explicitly defines a safe authorized auto-send scope.
